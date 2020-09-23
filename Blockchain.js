@@ -59,6 +59,7 @@ function Blockchain(config) {
     const url = require('url');
     const path = require('path');
     const stableStringify = require('json-stable-stringify');
+    const CompareVersions = require('./modules/CompareVersions');
 
     //Blockchain
     const Block = require('./modules/block');
@@ -70,7 +71,6 @@ function Blockchain(config) {
     const MessagesDispatcher = require('./modules/messagesDispatcher');
     const Frontend = require('./modules/frontend');
     const app = express();
-
 
     storj.put('app', app);
     storj.put('config', config);
@@ -317,6 +317,12 @@ function Blockchain(config) {
             }
         });
 
+        let subs = storj.get('newBlockSubscribers');
+        if (subs !== null && subs.length > 0) {
+            for (let subscriber of subs) {
+                subscriber();
+            }
+        }
     }
 
     /**
@@ -358,6 +364,7 @@ function Blockchain(config) {
 
         addBlockToChainIndex(maxBlock, block, noHandle, cb);
     }
+
 
     /**
      * Async verstion of blockchain.get
@@ -880,8 +887,12 @@ function Blockchain(config) {
          * @type {number}
          */
         fromBlock = (typeof fromBlock === 'undefined' ? 0 : Number(fromBlock));
-        if(fromBlock <= 5) {
-            //  limit = 3;
+        /*if(fromBlock <= 5) {
+              limit = 3;
+        }*/
+
+        if(!limit) {
+            limit = 5;
         }
 
         getAllChain(fromBlock, limit, function (blockchain) {
@@ -1052,7 +1063,7 @@ function Blockchain(config) {
      * Получили новую цепочку блоков
      * @param message
      */
-    function handleBlockchainResponse(message) {
+    function handleBlockchainResponse(message, preProcessedBlocks) {
 
         //We can't handle new blockchain while sync in progress
         if(blockHandler.syncInProgress) {
@@ -1068,8 +1079,12 @@ function Blockchain(config) {
         storj.put('chainResponseMutex', true);
 
 
-        let receivedBlocks = JSON.parse(message.data);
-
+        let receivedBlocks = undefined;
+        if (preProcessedBlocks !== undefined) {
+            receivedBlocks = preProcessedBlocks;
+        } else {
+            receivedBlocks = JSON.parse(message.data);
+        }
 
         if(receivedBlocks.length === 0 || receivedBlocks[0] === false) {
             storj.put('chainResponseMutex', false);
@@ -1110,23 +1125,37 @@ function Blockchain(config) {
                     if(receivedBlocks.length === 1) {
                         if(lastKnownBlock !== latestBlockReceived.index) {
                             logger.info('Synchronize: Received last chain block ' + latestBlockReceived.index);
+                        } else {
+                            logger.info('Synchronize: ' + latestBlockReceived.index);
                         }
                     } else {
                         if(config.program.verbose) {
                             logger.info('Synchronize: Received ' + latestBlockHeld.index + ' of ' + latestBlockReceived.index);
                         }
                     }
-                    if(latestBlockHeld.hash === latestBlockReceived.previousHash && latestBlockHeld.index > 5) { //когда получен один блок от того который у нас есть
+                    //console.log(latestBlockHeld.index, latestBlockReceived.index, latestBlockHeld.hash, latestBlockReceived.previousHash)
+                    if(latestBlockHeld.hash === latestBlockReceived.previousHash /*&& latestBlockHeld.index > 5*/) { //когда получен один блок от того который у нас есть
 
                         if(isValidChain(receivedBlocks) && (receivedBlocks[0].index <= maxBlock || receivedBlocks.length === 1)) {
                             addBlockToChain(latestBlockReceived, true);
                             responseLatestMsg(function (msg) {
+
+                                clearTimeout(replaceChainTimer);
+                                replaceChainTimer = setTimeout(function () {
+                                    //If receiving chain, no syncing
+                                    if(storj.get('chainResponseMutex')) {
+                                        return;
+                                    }
+                                    blockHandler.resync();
+                                }, config.peerExchangeInterval + 2000); //2000 в качестве доп времени
+
                                 storj.put('chainResponseMutex', false);
                                 broadcast(msg);
                             });
                         }
 
-                    } else if(receivedBlocks.length === 1) {
+                    } else if(receivedBlocks.length === 1 /*&& latestBlockHeld.index > 5*/) {
+                        //console.log('HERE');
 
                         let getBlockFrom = latestBlockHeld.index - config.blockQualityCheck;
 
@@ -1135,7 +1164,7 @@ function Blockchain(config) {
                             lastKnownBlock = maxBlock;
                         }
                         if(!blockHandler.syncInProgress) {
-                            broadcast(queryAllMsg(getBlockFrom));
+                            broadcast(queryAllMsg(getBlockFrom, config.maxBlockSend));
                         }
 
                         storj.put('chainResponseMutex', false);
@@ -1143,19 +1172,6 @@ function Blockchain(config) {
                     } else {
 
                         if(receivedBlocks[0].index <= maxBlock && receivedBlocks.length > 1) {
-                            //До 5го блока и при пустой ключнице и если у нас нет блока больше 5го синхронизация только по одному
-                            if(receivedBlocks[0].index <= 5 && receivedBlocks[0].index !== 0 && blockHandler.keyring.length === 0 && maxBlock <= 5) {
-                                receivedBlocks = [receivedBlocks[0], receivedBlocks[1]];
-                            }
-                            if(maxBlock <= 5) {
-                                if(receivedBlocks[0].index === 0) {
-                                    if(typeof receivedBlocks[2] !== 'undefined') {
-                                        receivedBlocks = [receivedBlocks[1], receivedBlocks[2]];
-                                    } else {
-                                        receivedBlocks = [receivedBlocks[1]];
-                                    }
-                                }
-                            }
                             replaceChain(receivedBlocks, function () {
                                 storj.put('chainResponseMutex', false);
                             });
@@ -1193,83 +1209,106 @@ function Blockchain(config) {
             fromBlock = 0;
         }
 
-        //Получаем блок, с которого выполняется проверка
-        getBlockById(fromBlock, function (err, lBlock) {
+        //Последний блок проверяемой цепочки
+        let toBlock = newBlocks[newBlocks.length - 1].index + 1;
+
+
+        getBlockById(toBlock, function (err, rBlock) {
             if(err) {
-                let error = new Error('Can\'t get block no ' + newBlocks[0].index + ' ' + err);
-
-                logger.error(error);
-                if(typeof cb !== 'undefined') {
-                    cb(error);
-                }
-                return;
+                rBlock = false;
             }
 
 
-            let maxIndex = maxBlock - config.limitedConfidenceBlockZone;
-            if(maxIndex < 0) {
-                maxIndex = 0;
-            }
+            //Получаем блок, с которого выполняется проверка
+            getBlockById(fromBlock, function (err, lBlock) {
+                if(err) {
+                    let error = new Error('Can\'t get block no ' + newBlocks[0].index + ' ' + err);
 
-            const validChain = isValidChain([lBlock].concat(newBlocks));
-
-            //Проверяем, что индекс первого блока в процеряемой цепочке не выходит за пределы Limited Confidence
-            if(!(newBlocks[0].index >= maxIndex)) {
-
-                let error = new Error('LimitedConfidence: Invalid chain');
-                if(config.program.verbose) {
                     logger.error(error);
-                }
-
-                if(typeof cb !== 'undefined') {
-                    cb(error);
-                }
-
-                return;
-            }
-
-
-            if(
-                validChain // &&  newBlocks[0].index >= maxIndex
-                /*&& newBlocks.length >= maxBlock*/
-            ) {
-                //console.log(newBlocks);
-                //logger.info('Received blockchain is valid.');
-                logger.info('Synchronize: ' + newBlocks[0].index + ' of ' + newBlocks[newBlocks.length - 1].index);
-                (async function () {
-                    for (let i of newBlocks) {
-                        await asyncAddBlockToChainIndex(i.index, i, true);
-                    }
-                    responseLatestMsg(function (msg) {
-                        broadcast(msg);
-                    });
-
-                    clearTimeout(replaceChainTimer);
-                    replaceChainTimer = setTimeout(function () {
-                        //If receiving chain, no syncing
-                        if(storj.get('chainResponseMutex')) {
-                            return;
-                        }
-                        blockHandler.resync();
-                    }, config.peerExchangeInterval + 2000); //2000 в качестве доп времени
-
-                    //All is ok
                     if(typeof cb !== 'undefined') {
-                        cb();
+                        cb(error);
+                    }
+                    return;
+                }
+
+
+                let maxIndex = maxBlock - config.limitedConfidenceBlockZone;
+                if(maxIndex < 0) {
+                    maxIndex = 0;
+                }
+
+                let validChain = false;
+                //Валидна ли переданная цепочка блоков
+                if(rBlock) {
+                    //Если новая цепочка должна встроится в существующую
+                    validChain = isValidChain(([lBlock].concat(newBlocks)).concat([rBlock]));
+                } else {
+                    //Если новая цепочка добавляется в конец
+                    validChain = isValidChain([lBlock].concat(newBlocks));
+                }
+
+
+                //Проверяем, что индекс первого блока в процеряемой цепочке не выходит за пределы Limited Confidence
+                if(!(newBlocks[0].index >= maxIndex)) {
+
+                    let error = new Error('LimitedConfidence: Invalid chain');
+                    if(config.program.verbose) {
+                        logger.error(error);
                     }
 
-                })();
+                    if(typeof cb !== 'undefined') {
+                        cb(error);
+                    }
 
-            } else {
-                let error = new Error('Received blockchain corrupted');
-                if(typeof cb !== 'undefined') {
-                    cb(error);
+                    return;
                 }
-                logger.error(error);
 
-            }
 
-        })
+                if(
+                    validChain // &&  newBlocks[0].index >= maxIndex
+                    /*&& newBlocks.length >= maxBlock*/
+                ) {
+
+                    //console.log(newBlocks);
+                    //logger.info('Received blockchain is valid.');
+                    logger.info('Synchronize: ' + newBlocks[0].index + ' of ' + newBlocks[newBlocks.length - 1].index);
+                    (async function () {
+                        for (let i of newBlocks) {
+                            await asyncAddBlockToChainIndex(i.index, i, true);
+                        }
+                        responseLatestMsg(function (msg) {
+                            broadcast(msg);
+                        });
+
+                        clearTimeout(replaceChainTimer);
+                        replaceChainTimer = setTimeout(function () {
+                            //If receiving chain, no syncing
+                            if(storj.get('chainResponseMutex')) {
+                                return;
+                            }
+                            blockHandler.resync();
+                        }, config.peerExchangeInterval + 2000); //2000 в качестве доп времени
+
+                        //All is ok
+                        if(typeof cb !== 'undefined') {
+                            cb();
+                        }
+
+                    })();
+
+                } else {
+                    let error = new Error('Received blockchain corrupted');
+                    if(typeof cb !== 'undefined') {
+                        cb(error);
+                    }
+                    logger.error(error);
+
+                }
+
+            })
+
+
+        });
     }
 
     /**
@@ -1325,11 +1364,11 @@ function Blockchain(config) {
     }
 
     /**
-     * Запрос всех блоков цепочки
+     * Запрос блоков цепочки
      * @returns {{type: number}}
      */
-    function queryAllMsg(fromIndex) {
-        return {'type': MessageType.QUERY_ALL, data: typeof fromIndex === 'undefined' ? 0 : fromIndex}
+    function queryAllMsg(fromIndex, limit) {
+        return {'type': MessageType.QUERY_ALL, data: typeof fromIndex === 'undefined' ? 0 : fromIndex, limit}
     }
 
     /**
@@ -1850,6 +1889,7 @@ function Blockchain(config) {
         })
     }
 
+
     blockchainObject = {
         config: config,
         validators: nodeMetaInfo,
@@ -1925,7 +1965,7 @@ function Blockchain(config) {
          * @param {Number} id
          * @param {Function} cb
          */
-        getBlockById: getBlockById
+        getBlockById: getBlockById,
     };
 
     //Init2
@@ -1962,36 +2002,71 @@ function Blockchain(config) {
      */
     function loadPlugin(plugin, blockchainObject, config, storj) {
         let pluginMod;
+        let path = '';
+        let isPathFull;
         try {
             //Direct module loading attempt
             try {
-                pluginMod = require(plugin)(blockchainObject, config, storj);
+                path = plugin;
+                pluginMod = require(path)(blockchainObject, config, storj);
+                path = '/' + path;
+                isPathFull = false;
             } catch (e) {
 
                 //Plugins path
                 try {
-                    pluginMod = require('./plugins/' + plugin)(blockchainObject, config, storj);
+                    path = './plugins/' + plugin;
+                    pluginMod = require(path)(blockchainObject, config, storj);
+                    path = '/.' + path;
+                    isPathFull = false;
                 } catch (e) {
 
                     //Starting dir search
                     try {
-                        pluginMod = require(process.cwd() + '/' + plugin)(blockchainObject, config, storj);
+                        path = process.cwd() + '/' + plugin;
+                        pluginMod = require(path)(blockchainObject, config, storj);
+                        isPathFull = true;
                     } catch (e) {
 
                         //Working dir search
                         try {
-                            pluginMod = require(config.workDir + '/' + plugin)(blockchainObject, config, storj);
+                            path = config.workDir + '/' + plugin;
+                            pluginMod = require(path)(blockchainObject, config, storj);
+                            isPathFull = false;
                         } catch (e) {
 
                             //Node modules in starting dir search
-                            pluginMod = require(process.cwd() + '/node_modules/' + plugin)(blockchainObject, config, storj);
+                            path = process.cwd() + '/node_modules/' + plugin;
+                            pluginMod = require(path)(blockchainObject, config, storj);
+                            isPathFull = true;
                         }
                     }
                 }
-
             }
         } catch (e) {
             return e;
+        }
+
+        let checked = checkPluginEnginesVersion(path, isPathFull);
+        if(true !== checked) {
+            return new Error(checked);
+        }
+
+        return true;
+    }
+
+    function checkPluginEnginesVersion(path, isPathFull) {
+        try {
+            let compareVersions = new CompareVersions(isPathFull);
+            let izzzioMinVersionNeed = compareVersions.readIzzzioMinVersionNeeded(path);
+            if(!izzzioMinVersionNeed) {
+            } else {
+                if(!compareVersions.isMinimumVersionMatch(izzzioMinVersionNeed, config.program.version())) {
+                    return 'need min version node: ' + izzzioMinVersionNeed + ' for plugin ' + path;
+                }
+            }
+        } catch (e) {
+            //return e;
         }
         return true;
     }
@@ -2021,6 +2096,3 @@ function Blockchain(config) {
 module.exports = Blockchain;
 
 //Work
-
-
-
